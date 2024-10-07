@@ -195,6 +195,7 @@ EXP_TYPE_CLASSIC = 'classic_conditions'
 EXP_TYPE_REDUCE = 'reduce'
 EXP_TYPE_RESAMPLE = 'resample'
 EXP_TYPE_MATH = 'math'
+EXP_TYPE_THRESHOLD = 'threshold'
 
 # Alert Expression Reducer Function
 EXP_REDUCER_FUNC_MIN = 'min'
@@ -573,7 +574,6 @@ class Target(object):
     Metric to show.
 
     :param target: Graphite way to select data
-    :param legendFormat: Target alias. Prometheus use legendFormat, other like Influx use alias. This set legendFormat as well as alias.
     """
 
     expr = attr.ib(default="")
@@ -599,35 +599,11 @@ class Target(object):
             'interval': self.interval,
             'intervalFactor': self.intervalFactor,
             'legendFormat': self.legendFormat,
-            'alias': self.legendFormat,
             'metric': self.metric,
             'refId': self.refId,
             'step': self.step,
             'instant': self.instant,
             'datasource': self.datasource,
-        }
-
-
-# Currently not deriving from `Target` because Grafana errors if fields like `query` are added to Loki targets
-@attr.s
-class LokiTarget(object):
-    """
-    Target for Loki LogQL queries
-    """
-
-    datasource = attr.ib(default='', validator=instance_of(str))
-    expr = attr.ib(default='', validator=instance_of(str))
-    hide = attr.ib(default=False, validator=instance_of(bool))
-
-    def to_json_data(self):
-        return {
-            'datasource': {
-                'type': 'loki',
-                'uid': self.datasource,
-            },
-            'expr': self.expr,
-            'hide': self.hide,
-            'queryType': 'range',
         }
 
 
@@ -1443,6 +1419,23 @@ class AlertExpression(object):
 
         return expression
 
+@attr.s
+class AlertExpressionv10(AlertExpression):
+    """
+    Specific to Grafana v10.x, adds support for threshold expression type
+    """
+    
+    expressionType = attr.ib(
+        default=EXP_TYPE_CLASSIC,
+        validator=in_([
+            EXP_TYPE_CLASSIC,
+            EXP_TYPE_REDUCE,
+            EXP_TYPE_RESAMPLE,
+            EXP_TYPE_MATH,
+            EXP_TYPE_THRESHOLD
+        ])
+    )
+
 
 @attr.s
 class Alert(object):
@@ -1530,6 +1523,16 @@ def is_valid_triggersv9(instance, attribute, value):
     for trigger in value:
         if not (isinstance(trigger, Target) or isinstance(trigger, AlertExpression)):
             raise ValueError(f"{attribute.name} must either be a Target or AlertExpression")
+
+        if isinstance(trigger, Target):
+            is_valid_target(instance, "alert trigger target", trigger)
+
+
+def is_valid_triggersv10(instance, attribute, value):
+    """Validator for AlertRule triggers for Grafana v9"""
+    for trigger in value:
+        if not (isinstance(trigger, Target) or isinstance(trigger, AlertExpressionv10)):
+            raise ValueError(f"{attribute.name} must either be a Target or AlertExpressionV10")
 
         if isinstance(trigger, Target):
             is_valid_target(instance, "alert trigger target", trigger)
@@ -1645,10 +1648,8 @@ class AlertRulev8(object):
 
 
 @attr.s
-class AlertRulev9(object):
+class _BaseAlertRule(object):
     """
-    Create a Grafana 9.x+ Alert Rule
-
     :param title: The alert's title, must be unique per folder
     :param triggers: A list of Targets and AlertConditions.
         The Target specifies the query, and the AlertCondition specifies how this is used to alert.
@@ -1675,7 +1676,6 @@ class AlertRulev9(object):
     """
 
     title = attr.ib()
-    triggers = attr.ib(factory=list, validator=is_valid_triggersv9)
     annotations = attr.ib(factory=dict, validator=instance_of(dict))
     labels = attr.ib(factory=dict, validator=instance_of(dict))
 
@@ -1703,7 +1703,7 @@ class AlertRulev9(object):
     dashboard_uid = attr.ib(default="", validator=instance_of(str))
     panel_id = attr.ib(default=0, validator=instance_of(int))
 
-    def to_json_data(self):
+    def _render_triggers(self):
         data = []
 
         for trigger in self.triggers:
@@ -1721,6 +1721,21 @@ class AlertRulev9(object):
             else:
                 data += [trigger.to_json_data()]
 
+        return data
+
+    def to_json_data(self):
+        pass
+
+
+@attr.s
+class AlertRulev9(_BaseAlertRule):
+    """
+    Create a Grafana 9.x+ Alert Rule
+    """
+    
+    triggers = attr.ib(factory=list, validator=is_valid_triggersv9)
+
+    def to_json_data(self):
         return {
             "uid": self.uid,
             "for": self.evaluateFor,
@@ -1729,10 +1744,32 @@ class AlertRulev9(object):
             "grafana_alert": {
                 "title": self.title,
                 "condition": self.condition,
-                "data": data,
+                "data": self._render_triggers(),
                 "no_data_state": self.noDataAlertState,
                 "exec_err_state": self.errorAlertState,
             },
+        }
+
+
+@attr.s
+class AlertRulev10(_BaseAlertRule):
+    """
+    Create a Grafana 10.x+ Alert Rule
+    """
+    
+    triggers = attr.ib(factory=list, validator=is_valid_triggersv10)
+
+    def to_json_data(self):
+        return {
+            "uid": self.uid,
+            "for": self.evaluateFor,
+            "labels": self.labels,
+            "annotations": self.annotations,
+            "title": self.title,
+            "condition": self.condition,
+            "data": self._render_triggers(),
+            "noDataState": self.noDataAlertState,
+            "execErrState": self.errorAlertState,
         }
 
 
@@ -3337,8 +3374,7 @@ class Table(Panel):
                             'displayMode': self.displayMode,
                             'filterable': self.filterable,
                         },
-                        'unit': self.unit,
-                        'mappings': self.mappings
+                        'unit': self.unit
                     },
                     'overrides': self.overrides
                 },
@@ -3465,7 +3501,6 @@ class GaugePanel(Panel):
     :param thresholdMarkers: option to show marker of level on gauge
     :param thresholds: single stat thresholds
     :param valueMaps: the list of value to text mappings
-    :param neutral: neutral point of gauge, leave empty to use Min as neutral point
     """
 
     allValues = attr.ib(default=False, validator=instance_of(bool))
@@ -3490,7 +3525,6 @@ class GaugePanel(Panel):
         validator=instance_of(list),
     )
     valueMaps = attr.ib(default=attr.Factory(list))
-    neutral = attr.ib(default=None)
 
     def to_json_data(self):
         return self.panel_json(
@@ -3508,9 +3542,6 @@ class GaugePanel(Panel):
                         'mappings': self.valueMaps,
                         'override': {},
                         'values': self.allValues,
-                        'custom': {
-                            'neutral': self.neutral,
-                        },
                     },
                     'showThresholdLabels': self.thresholdLabels,
                     'showThresholdMarkers': self.thresholdMarkers,
@@ -3864,8 +3895,6 @@ class PieChartv2(Panel):
     :param reduceOptionsValues: Calculate a single value per column or series or show each row
     :param tooltipMode: Tooltip mode
         single (Default), multi, none
-    :param tooltipSort: To sort the tooltips
-        none (Default), asc, desc
     :param unit: units
     """
 
@@ -3881,7 +3910,6 @@ class PieChartv2(Panel):
     reduceOptionsFields = attr.ib(default='', validator=instance_of(str))
     reduceOptionsValues = attr.ib(default=False, validator=instance_of(bool))
     tooltipMode = attr.ib(default='single', validator=instance_of(str))
-    tooltipSort = attr.ib(default='none', validator=instance_of(str))
     unit = attr.ib(default='', validator=instance_of(str))
 
     def to_json_data(self):
@@ -3906,8 +3934,7 @@ class PieChartv2(Panel):
                     },
                     'pieType': self.pieType,
                     'tooltip': {
-                        'mode': self.tooltipMode,
-                        'sort': self.tooltipSort
+                        'mode': self.tooltipMode
                     },
                     'legend': {
                         'displayMode': self.legendDisplayMode,
