@@ -1,0 +1,6 @@
+{
+  "repo": "cognosos/grafanalib",
+  "assemblies": {
+    "base": "any"
+  }
+}
